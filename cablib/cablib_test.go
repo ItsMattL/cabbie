@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	testPath = `Bar\Foo\Cabbie\`
+	testPath = `SOFTWARE\Bar`
 )
 
 var (
@@ -36,7 +36,7 @@ var (
 )
 
 func createTestKeys() error {
-	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, testPath, registry.CREATE_SUB_KEY)
+	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, testPath, registry.ALL_ACCESS)
 	if err != nil {
 		return err
 	}
@@ -197,7 +197,7 @@ func TestStringInSlice(t *testing.T) {
 	} {
 		o := StringInSlice(tt.st, tt.sl)
 		if o != tt.out {
-			t.Errorf("got %q, want %q", o, tt.out)
+			t.Errorf("got %t, want %t", o, tt.out)
 		}
 	}
 }
@@ -240,7 +240,7 @@ func TestSliceContains(t *testing.T) {
 	} {
 		o := SliceContains(tt.sl, tt.st)
 		if o != tt.out {
-			t.Errorf("got %q, want %q", o, tt.out)
+			t.Errorf("got %t, want %t", o, tt.out)
 		}
 	}
 }

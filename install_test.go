@@ -21,25 +21,49 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
-type testLog struct {
-	Handle int
+type testInstallLog struct {
 }
 
-func (f *testLog) Info(id uint32, msg string) error {
+func (f *testInstallLog) Info(id uint32, msg string) error {
 	return nil
 }
-func (f *testLog) Error(id uint32, msg string) error {
+func (f *testInstallLog) Error(id uint32, msg string) error {
 	return nil
 }
-func (f *testLog) Warning(id uint32, msg string) error {
+func (f *testInstallLog) Warning(id uint32, msg string) error {
 	return nil
 }
-func (f *testLog) Close() error {
+func (f *testInstallLog) Close() error {
 	return nil
 }
 
 func newFakeConfig() *Settings {
 	return &Settings{RequiredCategories: categoryDefaults}
+}
+
+func TestName(t *testing.T) {
+	name := "install"
+	install := &installCmd{}
+	got := install.Name()
+	if got != name {
+		t.Errorf("Name() got: %q, want: %q", got, name)
+	}
+}
+
+func TestSynopsis(t *testing.T) {
+	install := &installCmd{}
+	got := install.Synopsis()
+	if got == "" {
+		t.Errorf("Synopsis() got: %q, want: not empty", got)
+	}
+}
+
+func TestUsage(t *testing.T) {
+	install := &installCmd{}
+	got := install.Usage()
+	if got == "" {
+		t.Errorf("Usage() got: %q, want: not empty", got)
+	}
 }
 
 func TestGetCriteria(t *testing.T) {
@@ -53,7 +77,7 @@ func TestGetCriteria(t *testing.T) {
 		{installCmd{kbs: "KB1234567"}, string(search.BasicSearch), nil},
 		{installCmd{}, string(search.BasicSearch), categoryDefaults},
 	} {
-		elog = new(testLog)
+		elog = new(testInstallLog)
 		config = newFakeConfig()
 		oc, orc := tt.i.criteria()
 		if !(strings.Contains(oc, tt.outcriteria)) {

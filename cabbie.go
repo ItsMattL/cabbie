@@ -20,6 +20,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strings"
 	"time"
@@ -34,6 +36,7 @@ import (
 	"golang.org/x/sys/windows/svc/debug"
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc"
+	"github.com/go-ole/go-ole"
 	"github.com/google/subcommands"
 )
 
@@ -42,7 +45,7 @@ var (
 	runInDebug       = flag.Bool("debug", false, "Run in debug mode")
 	config           = new(Settings)
 	categoryDefaults = []string{"Critical Updates", "Definition Updates", "Security Updates"}
-	rebootEvent      = make(chan bool, 1)
+	rebootEvent      = make(chan bool, 10)
 	rebootActive     = false
 
 	// Metrics
@@ -67,6 +70,8 @@ type Settings struct {
 	AukeraEnabled uint64
 	AukeraPort    uint64
 	AukeraName    string
+
+	PprofPort uint64
 }
 
 type tickers struct {
@@ -152,6 +157,9 @@ func (s *Settings) regLoad(path string) error {
 	}
 	if i, _, err := k.GetIntegerValue("AukeraPort"); err == nil {
 		s.AukeraPort = i
+	}
+	if i, _, err := k.GetIntegerValue("PprofPort"); err == nil {
+		s.PprofPort = i
 	}
 
 	return nil
@@ -290,7 +298,7 @@ func runMainLoop() error {
 	for {
 		select {
 		case <-t.Default.C:
-			i := installCmd{}
+			i := installCmd{Interactive: false}
 			err := i.installUpdates()
 			if e := updateInstallSuccess.Set(err == nil); e != nil {
 				elog.Error(6, fmt.Sprintf("Error posting metric:\n%v", e))
@@ -313,7 +321,7 @@ func runMainLoop() error {
 				break
 			}
 			if s[0].State == "open" {
-				i := installCmd{}
+				i := installCmd{Interactive: false}
 				err := i.installUpdates()
 				if e := updateInstallSuccess.Set(err == nil); e != nil {
 					elog.Error(6, fmt.Sprintf("Error posting updateInstallSuccess metric:\n%v", e))
@@ -355,13 +363,13 @@ func runMainLoop() error {
 			}
 
 			if config.Deadline != 0 {
-				i := installCmd{deadlineOnly: true}
+				i := installCmd{Interactive: false, deadlineOnly: true}
 				if err := i.installUpdates(); err != nil {
 					elog.Error(6, fmt.Sprintf("Error installing system updates:\n%v", err))
 				}
 			}
 		case <-t.Virus.C:
-			i := installCmd{virusDef: true}
+			i := installCmd{Interactive: false, virusDef: true}
 			err := i.installUpdates()
 			if e := virusUpdateSuccess.Set(err == nil); e != nil {
 				elog.Error(6, fmt.Sprintf("Error posting virusUpdateSuccess metric:\n%v", err))
@@ -371,7 +379,7 @@ func runMainLoop() error {
 				break
 			}
 		case <-t.Driver.C:
-			i := installCmd{drivers: true}
+			i := installCmd{Interactive: false, drivers: true}
 			err := i.installUpdates()
 			if e := driverUpdateSuccess.Set(err == nil); e != nil {
 				elog.Error(6, fmt.Sprintf("Error posting driverUpdateSuccess metric:\n%v", e))
@@ -495,9 +503,16 @@ func main() {
 		elog.Error(6, fmt.Sprintf("Failed to load Cabbie config, using defaults:\n%v\nError:%v", config, err))
 	}
 
+	// If a profiling port is specified, start an HTTP server
+	if config.PprofPort != 0 {
+		go func() {
+			http.ListenAndServe(fmt.Sprintf("localhost:%d", config.PprofPort), nil)
+		}()
+	}
+
 	isIntSess, err := svc.IsAnInteractiveSession()
 	if err != nil {
-		elog.Error(1, fmt.Sprintf("Failed to determine if we are running in an interactive session: %v", err))
+		elog.Error(6, fmt.Sprintf("Failed to determine if we are running in an interactive session: %v", err))
 		os.Exit(2)
 	}
 
@@ -505,6 +520,12 @@ func main() {
 	if err := initMetrics(); err != nil {
 		elog.Error(6, err.Error())
 	}
+
+	if err := cablib.InitializeCOM(); err != nil {
+		elog.Error(6, err.Error())
+		os.Exit(1)
+	}
+	defer ole.CoUninitialize()
 
 	// Running as Service.
 	// TODO: move service logic into its own subcommand.
@@ -525,7 +546,7 @@ func main() {
 
 	subcommands.Register(&hideCmd{}, "Update management")
 	subcommands.Register(&historyCmd{}, "Update management")
-	subcommands.Register(&installCmd{}, "Update management")
+	subcommands.Register(&installCmd{Interactive: true}, "Update management")
 	subcommands.Register(&listCmd{}, "Update management")
 	subcommands.Register(&serviceCmd{}, "Service registration management")
 

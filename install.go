@@ -34,8 +34,8 @@ import (
 
 // Available flags
 type installCmd struct {
-	drivers, deadlineOnly, virusDef bool
-	kbs                             string
+	drivers, deadlineOnly, Interactive, virusDef bool
+	kbs                                          string
 }
 
 type installRsp struct {
@@ -168,6 +168,7 @@ func installCollection(s *session.UpdateSession, c *updatecollection.Collection)
 
 func (i *installCmd) installUpdates() error {
 	var rebootRequired bool
+
 	// Check for reboot status when not installing virus definitions.
 	if !(i.virusDef) {
 		rebootRequired, err := cablib.RebootRequired()
@@ -176,9 +177,25 @@ func (i *installCmd) installUpdates() error {
 		}
 
 		if rebootRequired {
+			if i.Interactive {
+				fmt.Println("Host has existing updates pending reboot.")
+				return nil
+			}
+			t, err := cablib.RebootTime()
+			if err != nil {
+				return fmt.Errorf("Error getting reboot time: %v", err)
+			}
+			if t.IsZero() {
+				// Set reboot time if a reboot is pending but no time has been set.
+				// This can happen when a user installs updates outside of Cabbie.
+				rebootMessage(int(config.RebootDelay))
+				if err := cablib.SetRebootTime(config.RebootDelay); err != nil {
+					return fmt.Errorf("Failed to set reboot time:\n%v", err)
+				}
+			}
 			rebootEvent <- rebootRequired
-			return nil
 		}
+		return nil
 	}
 
 	// Start Windows update session
@@ -212,6 +229,7 @@ func (i *installCmd) installUpdates() error {
 	elog.Info(4, fmt.Sprintf("Updates Found:\n%s", strings.Join(uc.Titles(), "\n\n")))
 
 	installMsgPopped := i.virusDef
+	installingMinOneUpdate := false
 
 	kbs := NewKBSet(i.kbs)
 	for _, u := range uc.Updates {
@@ -262,6 +280,16 @@ func (i *installCmd) installUpdates() error {
 		if !installMsgPopped && !u.InCategories([]string{"Definition Updates"}) {
 			installingMessage()
 			installMsgPopped = true
+
+			exist, err := cablib.PathExists(filepath.Join(cablib.CabbiePath, "PreUpdate.ps1"))
+			if err != nil {
+				elog.Error(207, fmt.Sprintf("PreUpdateScript: error checking existence of %q:\n%v", cablib.CabbiePath+"PreUpdate.ps1", err))
+			} else if exist {
+				if err := cablib.RunScript("PreUpdate.ps1"); err != nil {
+					elog.Error(208, fmt.Sprintf("PreUpdateScript: error running script:\n%v", err))
+				}
+			}
+			installingMinOneUpdate = true
 		}
 		elog.Info(002, fmt.Sprintf("Downloading Update:\n%v", u))
 
@@ -307,7 +335,22 @@ func (i *installCmd) installUpdates() error {
 		c.Close()
 	}
 
+	if installingMinOneUpdate {
+		exist, err := cablib.PathExists(filepath.Join(cablib.CabbiePath, "PostUpdate.ps1"))
+		if err != nil {
+			elog.Error(307, fmt.Sprintf("PostUpdateScript: error checking existence of %q:\n%v", cablib.CabbiePath+"PostUpdate.ps1", err))
+		} else if exist {
+			if err := cablib.RunScript("PostUpdate.ps1"); err != nil {
+				elog.Error(308, fmt.Sprintf("PostUpdateScript: error executing script:\n%v", err))
+			}
+		}
+	}
+
 	if rebootRequired {
+		if i.Interactive {
+			fmt.Println("Updates have been installed, please reboot to complete the installation...")
+			return nil
+		}
 		rebootMessage(int(config.RebootDelay))
 		if err := cablib.SetRebootTime(config.RebootDelay); err != nil {
 			elog.Error(306, fmt.Sprintf("Failed to run reboot command:\n%v", err))
