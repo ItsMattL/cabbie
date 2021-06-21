@@ -18,7 +18,7 @@
 package main
 
 import (
-	"context"
+	"golang.org/x/net/context"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
@@ -30,13 +30,14 @@ import (
 	"github.com/google/cabbie/metrics"
 	"github.com/google/cabbie/notification"
 	"github.com/google/cabbie/cablib"
+	"github.com/google/cabbie/enforcement"
 	"github.com/google/cabbie/servicemgr"
 	"github.com/google/aukera/client"
+	"github.com/scjalliance/comshim"
 	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc/debug"
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc"
-	"github.com/go-ole/go-ole"
 	"github.com/google/subcommands"
 )
 
@@ -54,6 +55,7 @@ var (
 	driverUpdateSuccess        = new(metrics.Bool)
 	updateInstallSuccess       = new(metrics.Bool)
 	rebootRequired             = new(metrics.Bool)
+	deviceIsPatched            = new(metrics.Bool)
 	requiredUpdateCount        = new(metrics.Int)
 	enforcedUpdateCount        = new(metrics.Int)
 	enforcementWatcherFailures = new(metrics.Int)
@@ -72,6 +74,8 @@ type Settings struct {
 	AukeraName    string
 
 	PprofPort uint64
+
+	ScriptTimeout time.Duration
 }
 
 type tickers struct {
@@ -108,6 +112,7 @@ func newSettings() *Settings {
 		Deadline:           14,
 		NotifyAvailable:    1,
 		AukeraPort:         9119,
+		ScriptTimeout:      10 * time.Minute,
 	}
 }
 
@@ -125,13 +130,15 @@ func (s *Settings) regLoad(path string) error {
 	if a, _, err := k.GetStringValue("AukeraName"); err == nil {
 		s.AukeraName = a
 	} else {
-		elog.Info(1, fmt.Sprintf("AukeraName not found in registry, using default Name:\n%v", s.AukeraName))
+		elog.Info(cablib.EvtErrConfig,
+			fmt.Sprintf("AukeraName not found in registry, using default Name:\n%v", s.AukeraName))
 	}
 
 	if m, _, err := k.GetStringsValue("RequiredCategories"); err == nil {
 		s.RequiredCategories = m
 	} else {
-		elog.Info(1, fmt.Sprintf("RequiredCategories not found in registry, using default categories:\n%v", s.RequiredCategories))
+		elog.Info(cablib.EvtErrConfig,
+			fmt.Sprintf("RequiredCategories not found in registry, using default categories:\n%v", s.RequiredCategories))
 	}
 
 	if i, _, err := k.GetIntegerValue("EnableThirdParty"); err == nil {
@@ -161,6 +168,9 @@ func (s *Settings) regLoad(path string) error {
 	if i, _, err := k.GetIntegerValue("PprofPort"); err == nil {
 		s.PprofPort = i
 	}
+	if i, _, err := k.GetIntegerValue("ScriptTimeout"); err == nil {
+		s.ScriptTimeout = time.Duration(i) * time.Minute
+	}
 
 	return nil
 }
@@ -169,7 +179,7 @@ func (s *Settings) regLoad(path string) error {
 type winSvc struct{}
 
 func startService(isDebug bool) error {
-	elog.Info(100, fmt.Sprintf("Starting %s service.", cablib.SvcName))
+	elog.Info(cablib.EvtServiceStarting, fmt.Sprintf("Starting %s service.", cablib.SvcName))
 	run := svc.Run
 	if isDebug {
 		run = debug.Run
@@ -177,7 +187,7 @@ func startService(isDebug bool) error {
 	if err := run(cablib.SvcName, winSvc{}); err != nil {
 		return fmt.Errorf("%s service failed. %v", cablib.SvcName, err)
 	}
-	elog.Info(101, fmt.Sprintf("%s service stopped.", cablib.SvcName))
+	elog.Info(cablib.EvtServiceStopped, fmt.Sprintf("%s service stopped.", cablib.SvcName))
 	return nil
 }
 
@@ -205,6 +215,10 @@ func initMetrics() error {
 	if err != nil {
 		return fmt.Errorf("unable to initialize rebootRequired metric: %v", err)
 	}
+	deviceIsPatched, err = metrics.NewBool(cablib.MetricRoot+"deviceIsPatched", cablib.MetricSvc)
+	if err != nil {
+		return fmt.Errorf("unable to initialize deviceIsPatched metric: %v", err)
+	}
 
 	// integer metrics
 	requiredUpdateCount, err = metrics.NewInt(cablib.MetricRoot+"requiredUpdateCount", cablib.MetricSvc)
@@ -217,7 +231,7 @@ func initMetrics() error {
 	}
 	enforcementWatcherFailures, err = metrics.NewCounter(cablib.MetricRoot+"enforcementWatcherFailures", cablib.MetricSvc)
 	if err != nil {
-		elog.Error(6, fmt.Sprintf("unable to create enforcementWatcherFailures metric: %v", err))
+		return fmt.Errorf("unable to create enforcementWatcherFailures metric: %v", err)
 	}
 
 	// string metrics
@@ -236,27 +250,52 @@ func initMetrics() error {
 func setRebootMetric() {
 	rbr, err := cablib.RebootRequired()
 	if err != nil {
-		elog.Error(6, err.Error())
+		elog.Error(cablib.EvtErrMetricReport, err.Error())
+		return
 	}
 
 	if err := rebootRequired.Set(rbr); err != nil {
-		elog.Error(6, err.Error())
+		elog.Error(cablib.EvtErrMetricReport, err.Error())
 	}
 
 	if rbr {
 		rebootEvent <- rbr
 	}
+}
 
+func enforce() error {
+	kbs, err := enforcement.Get()
+	if err != nil {
+		return fmt.Errorf("error retrieving required updates: %v", err)
+	}
+	if err := enforcedUpdateCount.Set(int64(len(kbs.Required))); err != nil {
+		elog.Error(cablib.EvtErrMetricReport, fmt.Sprintf("Error posting metric:\n%v", err))
+	}
+	var failures error
+	if len(kbs.Required) > 0 {
+		i := installCmd{kbs: strings.Join(kbs.Required, ",")}
+		if err := i.installUpdates(); err != nil {
+			failures = fmt.Errorf("error enforcing required updates: %v", err)
+			elog.Error(cablib.EvtErrInstallFailure, failures.Error())
+		}
+	}
+	if len(kbs.Hidden) > 0 {
+		if err := hide(NewKBSetFromSlice(kbs.Hidden)); err != nil {
+			failures = fmt.Errorf("error hiding updates: %v", err)
+			elog.Error(cablib.EvtErrHide, failures.Error())
+		}
+	}
+	return failures
 }
 
 func runMainLoop() error {
 	if err := notification.CleanNotifications(cablib.SvcName); err != nil {
-		elog.Error(6, fmt.Sprintf("Error clearing old notifications:\n%v", err))
+		elog.Error(cablib.EvtErrNotifications, fmt.Sprintf("Error clearing old notifications:\n%v", err))
 	}
 
 	if config.EnableThirdParty == 1 {
 		if err := enableThirdPartyUpdates(); err != nil {
-			elog.Error(6, fmt.Sprintf("Error configuring third party updates:\n%v", err))
+			elog.Error(cablib.EvtErrMisc, fmt.Sprintf("Error configuring third party updates:\n%v", err))
 		}
 	}
 
@@ -270,20 +309,20 @@ func runMainLoop() error {
 	var enforcedFile = make(chan string)
 	go func() {
 		for {
-			err := runEnforcementWatcher(enforcedFile)
-			elog.Error(6, fmt.Sprintf("failed to initialize enforcement config watcher; relying on enforcement schedule: %v", err))
+			err := enforcement.Watcher(enforcedFile)
+			elog.Error(cablib.EvtErrEnforcement, fmt.Sprintf("failed to initialize enforcement config watcher; relying on enforcement schedule: %v", err))
 			if err := enforcementWatcherFailures.Increment(); err != nil {
-				elog.Error(6, fmt.Sprintf("unable to increment enforcementWatcherFailures metric: %v", err))
+				elog.Error(cablib.EvtErrMetricReport, fmt.Sprintf("unable to increment enforcementWatcherFailures metric: %v", err))
 			}
 			time.Sleep(15 * time.Minute)
 		}
 	}()
 
 	if config.AukeraEnabled == 1 {
-		elog.Info(0001, "Host configured to use Aukera. Ignoring default timer.")
+		elog.Info(cablib.EvtMisc, "Host configured to use Aukera. Ignoring default timer.")
 		t.Default.Stop()
 	} else {
-		elog.Info(0001, "Using default update interval.")
+		elog.Info(cablib.EvtMisc, "Using default update interval.")
 		t.Aukera.Stop()
 	}
 
@@ -301,56 +340,57 @@ func runMainLoop() error {
 			i := installCmd{Interactive: false}
 			err := i.installUpdates()
 			if e := updateInstallSuccess.Set(err == nil); e != nil {
-				elog.Error(6, fmt.Sprintf("Error posting metric:\n%v", e))
+				elog.Error(cablib.EvtErrMetricReport, fmt.Sprintf("Error posting metric:\n%v", e))
 			}
 			setRebootMetric()
 			if err != nil {
-				elog.Error(6, fmt.Sprintf("Error installing system updates:\n%v", err))
+				elog.Error(cablib.EvtErrInstallFailure, fmt.Sprintf("Error installing system updates:\n%v", err))
 			}
 		case <-t.Aukera.C:
 			s, err := client.Label(int(config.AukeraPort), config.AukeraName)
 			if err != nil {
-				elog.Error(6, fmt.Sprintf("Error getting maintenance window %q with error:\n%v", config.AukeraName, err))
+				elog.Error(cablib.EvtErrMaintWindow, fmt.Sprintf("Error getting maintenance window %q with error:\n%v", config.AukeraName, err))
 				break
 			}
 			if *runInDebug {
 				fmt.Printf("Cabbie maintenance window schedule:\n%+v", s)
 			}
 			if len(s) == 0 {
-				elog.Error(6, fmt.Sprintf("Aukera maintenance window label %q not found, skipping update check...", config.AukeraName))
+				elog.Error(cablib.EvtErrMaintWindow,
+					fmt.Sprintf("Aukera maintenance window label %q not found, skipping update check...", config.AukeraName))
 				break
 			}
 			if s[0].State == "open" {
 				i := installCmd{Interactive: false}
 				err := i.installUpdates()
 				if e := updateInstallSuccess.Set(err == nil); e != nil {
-					elog.Error(6, fmt.Sprintf("Error posting updateInstallSuccess metric:\n%v", e))
+					elog.Error(cablib.EvtErrMetricReport, fmt.Sprintf("Error posting updateInstallSuccess metric:\n%v", e))
 				}
 				setRebootMetric()
 				if err != nil {
-					elog.Error(6, fmt.Sprintf("Error installing system updates:\n%v", err))
+					elog.Error(cablib.EvtErrInstallFailure, fmt.Sprintf("Error installing system updates:\n%v", err))
 				}
 			}
 		case <-t.List.C:
 			setRebootMetric()
 			requiredUpdates, optionalUpdates, err := listUpdates(true)
 			if e := listUpdateSuccess.Set(err == nil); e != nil {
-				elog.Error(6, fmt.Sprintf("Error posting listUpdateSuccess metric:\n%v", e))
+				elog.Error(cablib.EvtErrMetricReport, fmt.Sprintf("Error posting listUpdateSuccess metric:\n%v", e))
 			}
 			if err != nil {
-				elog.Error(6, fmt.Sprintf("Error getting the list of updates:\n%v", err))
+				elog.Error(cablib.EvtErrQueryFailure, fmt.Sprintf("Error getting the list of updates:\n%v", err))
 				break
 			}
 			if err := requiredUpdateCount.Set(int64(len(requiredUpdates))); err != nil {
-				elog.Error(6, fmt.Sprintf("Error posting requiredUpdateCount metric:\n%v", err))
+				elog.Error(cablib.EvtErrMetricReport, fmt.Sprintf("Error posting requiredUpdateCount metric:\n%v", err))
 			}
 
 			if len(requiredUpdates) == 0 {
-				elog.Info(1, "No required updates needed to install.")
+				elog.Info(cablib.EvtNoUpdates, "No required updates needed to install.")
 				break
 			}
 
-			elog.Info(4, fmt.Sprintf("Found %d required updates.\nRequired updates:\n%s\nOptional updates:\n%s",
+			elog.Info(cablib.EvtUpdatesFound, fmt.Sprintf("Found %d required updates.\nRequired updates:\n%s\nOptional updates:\n%s",
 				len(requiredUpdates),
 				strings.Join(requiredUpdates, "\n\n"),
 				strings.Join(optionalUpdates, "\n\n")),
@@ -358,67 +398,61 @@ func runMainLoop() error {
 
 			if config.NotifyAvailable == 1 {
 				if err := notification.NewNotification(cablib.SvcName, notification.NewAvailableUpdateMessage(), "availableUpdates"); err != nil {
-					elog.Error(6, fmt.Sprintf("Failed to create notification:\n%v", err))
+					elog.Error(cablib.EvtErrNotifications, fmt.Sprintf("Failed to create notification:\n%v", err))
 				}
 			}
 
 			if config.Deadline != 0 {
 				i := installCmd{Interactive: false, deadlineOnly: true}
 				if err := i.installUpdates(); err != nil {
-					elog.Error(6, fmt.Sprintf("Error installing system updates:\n%v", err))
+					elog.Error(cablib.EvtErrInstallFailure, fmt.Sprintf("Error installing system updates:\n%v", err))
 				}
 			}
 		case <-t.Virus.C:
 			i := installCmd{Interactive: false, virusDef: true}
 			err := i.installUpdates()
 			if e := virusUpdateSuccess.Set(err == nil); e != nil {
-				elog.Error(6, fmt.Sprintf("Error posting virusUpdateSuccess metric:\n%v", err))
+				elog.Error(cablib.EvtErrMetricReport, fmt.Sprintf("Error posting virusUpdateSuccess metric:\n%v", err))
 			}
 			if err != nil {
-				elog.Error(6, fmt.Sprintf("Error installing virus definitions:\n%v", err))
+				elog.Error(cablib.EvtErrInstallFailure, fmt.Sprintf("Error installing virus definitions:\n%v", err))
 				break
 			}
 		case <-t.Driver.C:
 			i := installCmd{Interactive: false, drivers: true}
 			err := i.installUpdates()
 			if e := driverUpdateSuccess.Set(err == nil); e != nil {
-				elog.Error(6, fmt.Sprintf("Error posting driverUpdateSuccess metric:\n%v", e))
+				elog.Error(cablib.EvtErrMetricReport, fmt.Sprintf("Error posting driverUpdateSuccess metric:\n%v", e))
 			}
 			if err != nil {
-				elog.Error(6, fmt.Sprintf("Error installing drivers:\n%v", err))
+				elog.Error(cablib.EvtErrInstallFailure, fmt.Sprintf("Error installing drivers:\n%v", err))
 			}
 			setRebootMetric()
 		case file := <-enforcedFile:
-			kbs, err := allEnforcements()
-			if err != nil {
-				elog.Error(6, fmt.Sprintf("Error retrieving required updates from %q:\n%v", file, err))
-			}
-			if err := kbs.install(); err != nil {
-				elog.Error(6, fmt.Sprintf("Error enforcing required updates:\n%v", err))
+			elog.Info(cablib.EvtEnforcementChange, fmt.Sprintf("Enforcement triggered by change in file %q.", file))
+			if err := enforce(); err != nil {
+				elog.Error(cablib.EvtErrInstallFailure, fmt.Sprintf("Error enforcing one or more updates:\n%v", err))
 			}
 		case <-t.Enforcement.C:
-			kbs, err := allEnforcements()
-			if err != nil {
-				elog.Error(6, fmt.Sprintf("Error gathering required updates:\n%v", err))
-			}
-			if err := kbs.install(); err != nil {
-				elog.Error(6, fmt.Sprintf("Error enforcing required updates:\n%v", err))
+			if err := enforce(); err != nil {
+				elog.Error(cablib.EvtErrInstallFailure, fmt.Sprintf("Error enforcing one or more updates:\n%v", err))
 			}
 		case <-rebootEvent:
 			go func() {
 				if !(rebootActive) {
 					rebootActive = true
-					elog.Info(2, "Reboot initiated...")
+					elog.Info(cablib.EvtReboot, "Reboot initiated...")
 					t, err := cablib.RebootTime()
 					if err != nil {
-						elog.Info(2, fmt.Sprintf("Error getting reboot time: %v", err))
+						elog.Error(cablib.EvtErrPowerMgmt, fmt.Sprintf("Error getting reboot time: %v", err))
+						return
 					}
 					if t.IsZero() {
-						elog.Info(2, "Zero time returned, no reboot defined.")
+						elog.Info(cablib.EvtMisc, "Zero time returned, no reboot defined.")
 						return
 					}
 					if err := cablib.SystemReboot(t); err != nil {
-						elog.Error(6, fmt.Sprintf("SystemReboot() error:\n%v", err))
+						elog.Error(cablib.EvtErrPowerMgmt, fmt.Sprintf("SystemReboot() error:\n%v", err))
 					}
 					rebootActive = false
 				}
@@ -437,7 +471,7 @@ func (m winSvc) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<
 	go func() {
 		errch <- runMainLoop()
 	}()
-	elog.Info(2, "Service started.")
+	elog.Info(cablib.EvtServiceStarted, "Service started.")
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
 loop:
@@ -445,7 +479,7 @@ loop:
 		select {
 		// Watch for the cabbie goroutine to fail for some reason.
 		case err := <-errch:
-			elog.Error(1, fmt.Sprintf("Cabbie goroutine has failed: %v", err))
+			elog.Error(cablib.EvtErrService, fmt.Sprintf("Cabbie goroutine has failed: %v", err))
 			break loop
 		// Watch for service signals.
 		case c := <-r:
@@ -455,7 +489,7 @@ loop:
 			case svc.Stop, svc.Shutdown:
 				break loop
 			default:
-				elog.Error(1, fmt.Sprintf("Unexpected control request #%d", c))
+				elog.Error(cablib.EvtErrService, fmt.Sprintf("Unexpected control request #%d", c))
 			}
 		}
 	}
@@ -500,7 +534,7 @@ func main() {
 	// Load Cabbie config settings.
 	config = newSettings()
 	if err = config.regLoad(cablib.RegPath); err != nil {
-		elog.Error(6, fmt.Sprintf("Failed to load Cabbie config, using defaults:\n%v\nError:%v", config, err))
+		elog.Error(cablib.EvtErrConfig, fmt.Sprintf("Failed to load Cabbie config, using defaults:\n%v\nError:%v", config, err))
 	}
 
 	// If a profiling port is specified, start an HTTP server
@@ -510,28 +544,25 @@ func main() {
 		}()
 	}
 
-	isIntSess, err := svc.IsAnInteractiveSession()
+	isSvc, err := svc.IsWindowsService()
 	if err != nil {
-		elog.Error(6, fmt.Sprintf("Failed to determine if we are running in an interactive session: %v", err))
+		elog.Error(cablib.EvtErrMisc, fmt.Sprintf("Failed to determine if we are running in an interactive session: %v", err))
 		os.Exit(2)
 	}
 
 	// Initialize metrics.
 	if err := initMetrics(); err != nil {
-		elog.Error(6, err.Error())
+		elog.Error(cablib.EvtErrMetricReport, err.Error())
 	}
 
-	if err := cablib.InitializeCOM(); err != nil {
-		elog.Error(6, err.Error())
-		os.Exit(1)
-	}
-	defer ole.CoUninitialize()
+	comshim.Add(1)
+	defer comshim.Done()
 
 	// Running as Service.
-	// TODO: move service logic into its own subcommand.
-	if !isIntSess && len(os.Args) == 1 {
+	// TODO(b/147692789): move service logic into its own subcommand.
+	if isSvc && len(os.Args) == 1 {
 		if err := startService(*runInDebug); err != nil {
-			elog.Error(1, fmt.Sprintf("Failed to run service: %v", err))
+			elog.Error(cablib.EvtErrService, fmt.Sprintf("Failed to run service: %v", err))
 			os.Exit(2)
 		}
 		os.Exit(0)
@@ -552,7 +583,7 @@ func main() {
 
 	if *runInDebug {
 		if err := startService(true); err != nil {
-			elog.Error(1, fmt.Sprintf("Failed to run service in debug mode: %v", err))
+			elog.Error(cablib.EvtErrService, fmt.Sprintf("Failed to run service in debug mode: %v", err))
 			os.Exit(2)
 		}
 	}
